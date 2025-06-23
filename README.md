@@ -20,7 +20,7 @@
 ### Build from Source
 
 ```bash
-git clone https://github.com/Far-Beyond-Dev/fbcli.git
+git clone https://github.com/Far-Beyond-Dev/fb-cli.git
 cd fbcli
 cargo build --release
 ```
