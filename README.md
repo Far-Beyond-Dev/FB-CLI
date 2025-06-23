@@ -21,7 +21,7 @@
 
 ```bash
 git clone https://github.com/Far-Beyond-Dev/fb-cli.git
-cd fbcli
+cd fb-cli
 cargo build --release
 ```
 
