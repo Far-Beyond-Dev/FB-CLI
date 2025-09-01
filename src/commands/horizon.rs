@@ -26,14 +26,20 @@ pub enum PluginCommand {
         #[arg(short, long)]
         path: Option<PathBuf>,
     },
-    /// Build the current plugin
+    /// Build a plugin (from plugin dir or Horizon repo root)
     Build {
+        /// Plugin name (positional, required if in Horizon repo root)
+        #[arg()]
+        plugin: Option<String>,
         /// Horizon project path (defaults to ../Horizon)
         #[arg(long)]
         horizon_path: Option<PathBuf>,
         /// Skip copying to Horizon plugins directory
         #[arg(long)]
         no_copy: bool,
+        /// Plugin name (optional, for --plugin usage)
+        #[arg(long)]
+        plugin_flag: Option<String>,
     },
 }
 
@@ -46,7 +52,11 @@ pub async fn handle_command(cmd: HorizonCommand) -> Result<()> {
 async fn handle_plugin_command(cmd: PluginCommand) -> Result<()> {
     match cmd {
         PluginCommand::New { name, path } => create_new_plugin(&name, path).await,
-        PluginCommand::Build { horizon_path, no_copy } => build_plugin(horizon_path, no_copy).await,
+        PluginCommand::Build { plugin, horizon_path, no_copy, plugin_flag } => {
+            // Prefer positional plugin argument, fallback to --plugin
+            let plugin_name = plugin.or(plugin_flag);
+            build_plugin(horizon_path, no_copy, plugin_name).await
+        }
     }
 }
 
@@ -127,7 +137,6 @@ fn update_cargo_toml(plugin_dir: &Path, plugin_name: &str) -> Result<()> {
 
 fn update_plugin_code(plugin_dir: &Path, plugin_name: &str) -> Result<()> {
     let lib_path = plugin_dir.join("src/lib.rs");
-    let content = fs::read_to_string(&lib_path)?;
     
     // Create a basic version of the greeter plugin with the new name
     let new_content = create_basic_plugin_template(plugin_name);
@@ -261,13 +270,66 @@ fn cleanup_plugin_directory(plugin_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn build_plugin(horizon_path: Option<PathBuf>, no_copy: bool) -> Result<()> {
+async fn build_plugin(horizon_path: Option<PathBuf>, no_copy: bool, plugin: Option<String>) -> Result<()> {
     println!("🔨 Building Horizon plugin...");
-    
-    // Check if we're in a plugin directory
-    if !Path::new("Cargo.toml").exists() {
-        return Err(anyhow!("No Cargo.toml found. Are you in a plugin directory?"));
-    }
+
+    // Determine if we're in Horizon repo root or plugin crate dir
+    let current_dir = std::env::current_dir()?;
+    let cargo_toml = current_dir.join("Cargo.toml");
+    let crates_dir = current_dir.join("crates");
+    let in_plugin_dir = cargo_toml.exists();
+    let in_horizon_root = crates_dir.exists();
+
+    let (plugin_dir, package_name) = {
+        // Use directory name for plugin detection, but use package name for DLL search
+        let dir_name = current_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if dir_name == "plugin_system" {
+            return Err(anyhow!("plugin_system is not a buildable plugin crate"));
+        }
+        if in_plugin_dir && dir_name.starts_with("plugin_") {
+            println!("[DEBUG] Detected plugin crate by directory name: {}", dir_name);
+            let cargo_toml_path = current_dir.join("Cargo.toml");
+            let content = fs::read_to_string(&cargo_toml_path)?;
+            let doc = content.parse::<Document>()?;
+            let pkg_table = doc.get("package").and_then(|t| t.as_table());
+            let pkg_name = pkg_table.and_then(|t| t.get("name")).and_then(|n| n.as_str());
+            let pkg_name = match pkg_name {
+                Some(name) => name.to_string(),
+                None => {
+                    return Err(anyhow!("Cargo.toml missing [package] name field ({}).", cargo_toml_path.display()));
+                }
+            };
+            (current_dir.clone(), pkg_name)
+        } else if in_horizon_root {
+            let plugin_arg = plugin.ok_or_else(|| anyhow!("--plugin argument required when in Horizon repo root"))?;
+            let mut crate_name = plugin_arg.clone();
+            if !crate_name.starts_with("plugin_") {
+                crate_name = format!("plugin_{}", crate_name);
+            }
+            if crate_name == "plugin_system" {
+                return Err(anyhow!("plugin_system is not a buildable plugin crate"));
+            }
+            let plugin_path = crates_dir.join(&crate_name);
+            if !plugin_path.exists() {
+                return Err(anyhow!("Plugin crate '{}' not found in crates dir", crate_name));
+            }
+            println!("[DEBUG] Detected plugin crate by directory name: {}", crate_name);
+            let cargo_toml_path = plugin_path.join("Cargo.toml");
+            let content = fs::read_to_string(&cargo_toml_path)?;
+            let doc = content.parse::<Document>()?;
+            let pkg_table = doc.get("package").and_then(|t| t.as_table());
+            let pkg_name = pkg_table.and_then(|t| t.get("name")).and_then(|n| n.as_str());
+            let pkg_name = match pkg_name {
+                Some(name) => name.to_string(),
+                None => {
+                    return Err(anyhow!("Cargo.toml missing [package] name field ({}).", cargo_toml_path.display()));
+                }
+            };
+            (plugin_path, pkg_name)
+        } else {
+            return Err(anyhow!("Not in a plugin crate directory or Horizon repo root"));
+        }
+    };
 
     // Create progress bar
     let pb = ProgressBar::new(if no_copy { 2 } else { 3 });
@@ -280,12 +342,38 @@ async fn build_plugin(horizon_path: Option<PathBuf>, no_copy: bool) -> Result<()
 
     // Step 1: Build the plugin
     pb.set_message("Building plugin (release mode)...");
-    build_release()?;
+    build_release_in_dir(&plugin_dir)?;
     pb.inc(1);
 
     // Step 2: Find the built library
     pb.set_message("Locating built library...");
-    let lib_path = find_built_library()?;
+    let lib_path = if in_horizon_root {
+        // Built library is in workspace root target/release
+        let workspace_target_dir = current_dir.join("target/release");
+        find_built_library_in_workspace(&workspace_target_dir, &package_name)?
+    } else {
+        // Check for workspace root in parent directories
+        let mut ancestor = plugin_dir.as_path();
+        let mut workspace_root = None;
+        while let Some(parent) = ancestor.parent() {
+            let candidate = parent.join("Cargo.toml");
+            if candidate.exists() {
+                let content = fs::read_to_string(&candidate)?;
+                if content.contains("[workspace]") {
+                    workspace_root = Some(parent.to_path_buf());
+                    break;
+                }
+            }
+            ancestor = parent;
+        }
+        let target_dir = if let Some(root) = workspace_root {
+            println!("[DEBUG] Found workspace root: {}", root.display());
+            root.join("target/release")
+        } else {
+            plugin_dir.join("target/release")
+        };
+        find_built_library_in_workspace(&target_dir, &package_name)?
+    };
     pb.inc(1);
 
     // Step 3: Copy to Horizon plugins directory (if not skipped)
@@ -301,15 +389,65 @@ async fn build_plugin(horizon_path: Option<PathBuf>, no_copy: bool) -> Result<()
     println!();
     println!("{}", "🎉 Plugin built successfully!".green().bold());
     println!("📄 Library: {}", style(lib_path.display()).yellow());
-    
+
     if !no_copy {
         let target_path = horizon_path.unwrap_or_else(|| PathBuf::from("../Horizon"));
         let plugins_dir = target_path.join("plugins");
         println!("📁 Copied to: {}", style(plugins_dir.display()).yellow());
     }
-    
+
     println!();
     Ok(())
+}
+
+fn build_release_in_dir(dir: &Path) -> Result<()> {
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(dir)
+        .output()
+        .context("Failed to execute cargo build")?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("Cargo build failed:\n{}", error));
+    }
+
+    Ok(())
+}
+
+fn find_built_library_in_dir(plugin_dir: &Path, plugin_name: &str) -> Result<PathBuf> {
+    let target_dir = plugin_dir.join("target/release");
+    find_built_library_in_workspace(&target_dir, plugin_name)
+}
+
+fn find_built_library_in_workspace(target_dir: &Path, plugin_name: &str) -> Result<PathBuf> {
+    if !target_dir.exists() {
+        return Err(anyhow!("Release target directory not found for plugin {} ({}).", plugin_name, target_dir.display()));
+    }
+    // Look for library files with common extensions
+    let extensions = if cfg!(target_os = "windows") {
+        vec!["dll"]
+    } else if cfg!(target_os = "macos") {
+        vec!["dylib"]
+    } else {
+        vec!["so"]
+    };
+    for entry in WalkDir::new(&target_dir).max_depth(1) {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(extension) = path.extension() {
+            if extensions.contains(&extension.to_string_lossy().as_ref()) {
+                if let Some(file_name) = path.file_name() {
+                    let name = file_name.to_string_lossy();
+                    // Match plugin library name
+                    if name.starts_with(plugin_name) || (name.starts_with("plugin_") && name.contains(&plugin_name)) {
+                        return Ok(path.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    Err(anyhow!("Could not find built plugin library in {} for plugin {}", target_dir.display(), plugin_name))
 }
 
 fn build_release() -> Result<()> {
